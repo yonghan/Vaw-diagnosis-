@@ -20,8 +20,8 @@ sudo ip link set can0 up type can bitrate 500000        # PEAK, CANable (candlel
 sudo slcand -o -c -s6 /dev/ttyACM0 slcan0 && sudo ip link set slcan0 up   # serial/slcan adapters
 ```
 
-Not supported: K-line/KKL cables, ELM327 (planned), and pre-~2008 VW TP 2.0 / KWP2000
-cars.
+Not supported yet: K-line/KKL cables, ELM327, and proprietary adapters such as
+HEX-V2 (and clones), which speak their own USB protocol rather than SocketCAN.
 
 ## Install & use
 
@@ -47,16 +47,35 @@ Module addresses follow the VAG convention (01 Engine, 03 Brakes, 17 Instruments
 cars; override per car with `--tx 713 --rx 77D`.
 
 Fault codes are shown as `VAG-number  SAE-code-FTB  status`. The 5-digit VAG
-number is derived only for generic powertrain codes (P0xxx/P2xxx); others show `-----`.
+number is derived only for powertrain codes (P0xxx-P3xxx, 16384 + the code number); others show `-----`.
+
+## Older cars: TP 2.0 + KWP2000
+
+Cars up to roughly 2012 (e.g. a 2010 Audi Q5) talk **KWP2000 over VW TP 2.0** to most
+modules; only the engine ECU also answers plain OBD-II on `7E0`. Select it with
+`-p tp20`, or leave the default `-p auto`, which tries TP 2.0 first and falls back to UDS:
+
+```
+vwdiag -i can0 scan                  # shows [KWP2000/TP2.0] or [UDS/ISO-TP] per module
+vwdiag -i can0 -m 15 dtc             # airbag faults over KWP2000 (5-digit VAG number + P-code if any)
+vwdiag -i can0 -m 17 ident
+vwdiag -i can0 -m 01 raw 1A9B        # any KWP request; the channel is opened for you
+```
+
+**Status:** implemented from public protocol documentation and tested only against the
+built-in simulator (`-i sim-tp20`), not yet against a real car. Please report what
+differs. Channel-setup ids, timing and ident record layout are the likely places.
+KWP ident records are shown as their printable text fields, not parsed.
 
 ## Try it without a car
 
-`-i sim` runs a simulated set of ECUs (engine, brakes, instrument cluster, gateway)
-on an in-process virtual bus:
+`-i sim` runs a simulated UDS car (engine, brakes, instrument cluster, gateway) and
+`-i sim-tp20` a 2010-style car (KWP2000 over TP 2.0) on an in-process virtual bus:
 
 ```
 vwdiag -i sim scan
 vwdiag -i sim live -n 5
+vwdiag -i sim-tp20 -m 15 dtc
 ```
 
 ## Development
@@ -65,10 +84,11 @@ vwdiag -i sim live -n 5
 pip install -e .[dev] && pytest
 ```
 
-Layout: `can.py` (SocketCAN / virtual bus), `isotp.py`, `uds.py`, `obd.py`,
-`vag.py` (modules, DTC formatting), `sim.py`, `cli.py`.
+Layout: `can.py` (SocketCAN / virtual bus), `isotp.py`, `tp20.py`, `uds.py` (UDS + KWP2000
+clients), `session.py` (protocol-agnostic sessions), `obd.py`, `vag.py` (modules, DTC
+formatting), `sim.py`, `cli.py`.
 
 ## Roadmap
 
-Measuring blocks / adaptation / coding, security access, long coding helper,
-ELM327 and TP 2.0 support, DoIP for newer MEB cars.
+Measuring blocks (KWP `21`), adaptation / coding, security access, a HEX-V2 USB
+backend, ELM327, DoIP for newer MEB cars.

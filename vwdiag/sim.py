@@ -9,7 +9,8 @@ from typing import Dict, List, Optional
 
 from .can import VirtualNetwork
 from .isotp import IsoTp
-from .vag import FUNCTIONAL_ID, MODULES, Dtc, Module
+from .tp20 import SETUP_ID, Tp20Channel
+from .vag import FUNCTIONAL_ID, MODULES, Dtc, KwpDtc, Module
 
 
 def _live_pids(t: float) -> Dict[int, bytes]:
@@ -38,13 +39,13 @@ class SimEcu(threading.Thread):
                         also_accept=(FUNCTIONAL_ID,) if obd else ())
         self.vin = dids.get(0xF190, b"")
         self.t0 = time.monotonic()
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._halt.set()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             req = self.tp.recv(0.05)
             if req:
                 resp = self.handle(req)
@@ -108,14 +109,86 @@ class SimEcu(threading.Thread):
         return None
 
 
+class SimTp20Ecu(threading.Thread):
+    """A KWP2000-over-TP2.0 module (the way a ~2010 Audi talks)."""
+
+    def __init__(self, net: VirtualNetwork, module: Module, ident: bytes, dtcs: List[KwpDtc]):
+        super().__init__(daemon=True)
+        self.module, self.ident_data, self.dtcs = module, ident, list(dtcs)
+        self.bus = net.bus()
+        self.chan: Optional[Tp20Channel] = None
+        self._halt = threading.Event()
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def run(self) -> None:
+        addr = self.module.address
+        while not self._halt.is_set():
+            if self.chan is None:
+                f = self.bus.recv(0.05)
+                if (f and f.arbitration_id == SETUP_ID and len(f.data) >= 7
+                        and f.data[0] == addr and f.data[1] == 0xC0):
+                    ecu_tx = int.from_bytes(f.data[4:6], "little")  # tester receives here
+                    ecu_rx = 0x740 + addr
+                    self.chan = Tp20Channel(self.bus, tx_id=ecu_tx, rx_id=ecu_rx, t3=0x4A)
+                    from .can import Frame
+
+                    self.bus.send(Frame(SETUP_ID + addr, bytes([0x00, 0xD0])
+                                        + ecu_tx.to_bytes(2, "little")
+                                        + ecu_rx.to_bytes(2, "little") + b"\x01"))
+                continue
+            msg = self.chan.recv(0.05)
+            if self.chan.closed:
+                self.chan = None
+            elif msg:
+                resp = self.handle(msg)
+                if resp:
+                    self.chan.send(resp)
+        self.bus.close()
+
+    def handle(self, req: bytes) -> Optional[bytes]:
+        sid = req[0]
+        if sid == 0x10 and len(req) == 2:
+            return bytes([0x50, req[1]])
+        if sid == 0x3E:
+            return bytes([0x7E])
+        if sid == 0x1A and len(req) == 2:
+            if req[1] == 0x9B:
+                return bytes([0x5A, 0x9B]) + self.ident_data
+            return bytes([0x7F, sid, 0x12])
+        if sid == 0x18 and req[1:] == b"\x02\xff\x00":
+            return (bytes([0x58, len(self.dtcs)])
+                    + b"".join(d.code.to_bytes(2, "big") + bytes([d.status]) for d in self.dtcs))
+        if sid == 0x14 and req[1:] == b"\xff\x00":
+            self.dtcs.clear()
+            return bytes([0x54, 0xFF, 0x00])
+        return bytes([0x7F, sid, 0x11])
+
+
 class Simulator:
     """A handful of ECUs; `bus()` yields a tester-side bus."""
 
     VIN = b"WVWZZZ1KZAW000001"
 
-    def __init__(self) -> None:
+    def __init__(self, profile: str = "mqb") -> None:
         self.net = VirtualNetwork()
         by_addr = {m.address: m for m in MODULES}
+        if profile == "q5":
+            # ~2010 car: emissions OBD-II on 7E0, everything else KWP2000 over TP 2.0
+            self.ecus = [
+                SimEcu(self.net, by_addr[0x01], {0xF190: self.VIN},
+                       [Dtc(0x030000, 0x2F), Dtc(0x013400, 0x04)], obd=True),
+                SimTp20Ecu(self.net, by_addr[0x01], b"8R0907115A \x00 2.0l R4/4V TFSI  \x00 0012 \x00",
+                           [KwpDtc(16684, 0x2F), KwpDtc(16518, 0x04), KwpDtc(17963, 0x2F)]),
+                SimTp20Ecu(self.net, by_addr[0x03], b"8K0907379AB \x00 ESP  \x00 0201 \x00", []),
+                SimTp20Ecu(self.net, by_addr[0x15], b"8K0959655C \x00 Airbag  \x00 0004 \x00",
+                           [KwpDtc(1234, 0x20)]),
+                SimTp20Ecu(self.net, by_addr[0x17], b"8R0920930A \x00 KOMBI \x00 0120 \x00", []),
+            ]
+            for e in self.ecus:
+                e.start()
+            return
 
         def ident(part: bytes, sw: bytes) -> Dict[int, bytes]:
             return {0xF190: self.VIN, 0xF187: part, 0xF189: sw, 0xF191: b"H01",

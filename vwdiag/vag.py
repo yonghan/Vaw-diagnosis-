@@ -97,13 +97,19 @@ def sae_code(b0: int, b1: int) -> str:
 
 
 def vag_number(sae: str) -> Optional[int]:
-    """VAG 5-digit fault number for generic powertrain codes (P0xxx/P2xxx).
+    """VAG 5-digit fault number for powertrain codes: P0300 -> 16684 (16384 + 300).
 
-    P0300 -> 16684 (16384 + 300). Manufacturer-specific codes use other
-    numbering and return None.
+    Codes of other groups (B/C/U) use different numbering and return None.
     """
-    if len(sae) == 5 and sae[0] == "P" and sae[1] in "02" and sae[2:].isdigit():
-        return 16384 + int(sae[1]) * 1000 + int(sae[2:])
+    if len(sae) == 5 and sae[0] == "P" and sae[1:].isdigit():
+        return 16384 + int(sae[1:])
+    return None
+
+
+def sae_from_vag(n: int) -> Optional[str]:
+    """Inverse of vag_number for powertrain codes."""
+    if 16384 <= n < 16384 + 4000:
+        return f"P{n - 16384:04d}"
     return None
 
 
@@ -132,3 +138,26 @@ class Dtc:
         vag = self.vag
         vag_s = f"{vag:05d}" if vag is not None else "-----"
         return f"{vag_s}  {self.sae}-{self.ftb:02X}  status=0x{self.status:02X}"
+
+
+@dataclass
+class KwpDtc:
+    """Fault code as reported by KWP2000: 16-bit VAG number plus a status byte."""
+
+    code: int
+    status: int = 0
+
+    @property
+    def sae(self) -> Optional[str]:
+        return sae_from_vag(self.code)
+
+    @property
+    def vag(self) -> int:
+        return self.code
+
+    @property
+    def status_flags(self) -> List[str]:
+        return []  # KWP status bytes are ECU specific
+
+    def __str__(self) -> str:
+        return f"{self.code:05d}  {self.sae or '-----'}  status=0x{self.status:02X}"

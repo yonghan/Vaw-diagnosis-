@@ -11,8 +11,10 @@ from . import __version__
 from .can import Bus, SocketCanBus
 from .isotp import IsoTp, IsoTpError
 from .obd import PIDS, ObdClient, resolve_pid
-from .uds import UdsClient, UdsError, UdsNegativeResponse, UdsTimeout
-from .vag import IDENT_DIDS, MODULES, Module, find_module
+from .session import connect, printable
+from .tp20 import Tp20Error
+from .uds import UdsError, UdsTimeout
+from .vag import MODULES, Module, find_module
 
 
 def _hex(s: str) -> int:
@@ -23,8 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vwdiag", description="VW Group diagnostics over CAN (UDS / OBD-II)")
     p.add_argument("--version", action="version", version=f"vwdiag {__version__}")
     p.add_argument("-i", "--interface", default="can0",
-                   help="SocketCAN interface (can0, vcan0, slcan0 ...) or 'sim' for a built-in simulator")
+                   help="SocketCAN interface (can0, vcan0, slcan0 ...), or a built-in simulator: "
+                        "'sim' (UDS car) / 'sim-tp20' (2010-style TP 2.0 car)")
     p.add_argument("-m", "--module", default="01", help="module address (01) or name (engine); default 01")
+    p.add_argument("-p", "--protocol", choices=["auto", "uds", "tp20"], default="auto",
+                   help="uds = UDS/ISO-TP, tp20 = KWP2000 over VW TP 2.0 (older cars), auto = try both")
     p.add_argument("--tx", type=_hex, help="override tester->ECU CAN id (hex)")
     p.add_argument("--rx", type=_hex, help="override ECU->tester CAN id (hex)")
     p.add_argument("--timeout", type=float, default=1.0, help="response timeout in seconds")
@@ -61,19 +66,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def open_bus(name: str) -> Tuple[Bus, Optional[object]]:
-    if name == "sim":
+    if name in ("sim", "sim-tp20"):
         from .sim import Simulator
 
-        sim = Simulator()
+        sim = Simulator("q5" if name == "sim-tp20" else "mqb")
         return sim.bus(), sim
     return SocketCanBus(name), None
 
 
-def _channel(args, module: Optional[Module] = None) -> Tuple[IsoTp, Module]:
+def _diag(args, module: Optional[Module] = None):
     m = module or find_module(args.module)
-    tx = args.tx if args.tx is not None else m.tx_id
-    rx = args.rx if args.rx is not None else m.rx_id
-    return IsoTp(args.bus, tx, rx, padding=args.padding, timeout=args.timeout), m
+    d = connect(args.bus, m, args.protocol, timeout=args.timeout, padding=args.padding,
+                tx=args.tx, rx=args.rx)
+    return d, m
 
 
 def _confirm(args, what: str) -> bool:
@@ -83,20 +88,6 @@ def _confirm(args, what: str) -> bool:
         print("refusing without --yes on non-interactive input", file=sys.stderr)
         return False
     return input(f"{what} Proceed? [y/N] ").strip().lower() == "y"
-
-
-def _text(b: bytes) -> str:
-    return b.rstrip(b"\0\xff ").decode("ascii", "replace") if all(32 <= x < 127 or x in (0, 255) for x in b) else b.hex().upper()
-
-
-def _read_ident(uds: UdsClient) -> List[Tuple[str, str]]:
-    out = []
-    for did, name in IDENT_DIDS.items():
-        try:
-            out.append((name, _text(uds.read_did(did))))
-        except UdsNegativeResponse:
-            continue
-    return out
 
 
 def cmd_modules(args) -> int:
@@ -109,85 +100,104 @@ def cmd_modules(args) -> int:
 def cmd_scan(args) -> int:
     found = 0
     for m in MODULES:
-        tp = IsoTp(args.bus, m.tx_id, m.rx_id, padding=args.padding, timeout=min(args.timeout, 0.3))
-        uds = UdsClient(tp, p2=min(args.timeout, 0.3))
         try:
-            uds.tester_present()
-        except UdsNegativeResponse:
-            pass  # it answered, so it is there
-        except (UdsTimeout, IsoTpError):
+            d = connect(args.bus, m, args.protocol, timeout=args.timeout, padding=args.padding)
+        except (UdsError, IsoTpError, Tp20Error):
             print(f"{m.address:02X} {m.name:<18} -- no response")
             continue
-        found += 1
-        uds.p2 = args.timeout
-        info = dict(_read_ident(uds))
         try:
-            n = len(uds.read_dtcs())
-            dtc = f"{n} DTC" if n else "no DTC"
-        except UdsError:
-            dtc = "DTC n/a"
-        part = info.get("Spare part number", "?")
-        sw = info.get("Software version", "?")
-        print(f"{m.address:02X} {m.name:<18} OK  part={part} sw={sw}  {dtc}")
+            found += 1
+            info = d.ident()
+            try:
+                n = len(d.dtcs())
+                dtc = f"{n} DTC" if n else "no DTC"
+            except (UdsError, Tp20Error):
+                dtc = "DTC n/a"
+            summary = "  ".join(f"{k}={v}" for k, v in info[:2]) or "(no ident)"
+            print(f"{m.address:02X} {m.name:<18} OK  [{d.protocol}]  {summary}  {dtc}")
+        except (UdsError, Tp20Error) as e:
+            print(f"{m.address:02X} {m.name:<18} OK  [{d.protocol}]  error: {e}")
+        finally:
+            d.close()
     print(f"\n{found} module(s) responded")
     return 0 if found else 1
 
 
 def cmd_ident(args) -> int:
-    tp, m = _channel(args)
-    print(f"Module {m.address:02X} {m.name}  (tx={tp.tx_id:03X} rx={tp.rx_id:03X})")
-    items = _read_ident(UdsClient(tp, p2=args.timeout))
-    for k, v in items:
-        print(f"  {k:<20} {v}")
-    return 0 if items else 1
+    d, m = _diag(args)
+    try:
+        print(f"Module {m.address:02X} {m.name}  [{d.protocol}]")
+        items = d.ident()
+        for k, v in items:
+            print(f"  {k:<20} {v}")
+        return 0 if items else 1
+    finally:
+        d.close()
 
 
 def cmd_dtc(args) -> int:
-    tp, m = _channel(args)
-    dtcs = UdsClient(tp, p2=args.timeout).read_dtcs()
-    print(f"Module {m.address:02X} {m.name}: {len(dtcs)} fault code(s)")
-    for d in dtcs:
-        print(f"  {d}")
-        print(f"      {', '.join(d.status_flags) or 'no flags'}")
-    return 0
+    d, m = _diag(args)
+    try:
+        dtcs = d.dtcs()
+        print(f"Module {m.address:02X} {m.name} [{d.protocol}]: {len(dtcs)} fault code(s)")
+        for c in dtcs:
+            print(f"  {c}")
+            if c.status_flags:
+                print(f"      {', '.join(c.status_flags)}")
+        return 0
+    finally:
+        d.close()
 
 
 def cmd_clear(args) -> int:
-    tp, m = _channel(args)
-    if not _confirm(args, f"This erases all fault codes in {m.name}."):
-        return 2
-    UdsClient(tp, p2=args.timeout).clear_dtcs()
-    print("Fault codes cleared.")
-    return 0
+    d, m = _diag(args)
+    try:
+        if not _confirm(args, f"This erases all fault codes in {m.name}."):
+            return 2
+        d.clear()
+        print("Fault codes cleared.")
+        return 0
+    finally:
+        d.close()
 
 
 def cmd_reset(args) -> int:
-    tp, m = _channel(args)
-    if not _confirm(args, f"This resets {m.name}."):
-        return 2
-    UdsClient(tp, p2=args.timeout).ecu_reset({"hard": 1, "key-off": 2, "soft": 3}[args.type])
-    print("Reset accepted.")
-    return 0
+    d, m = _diag(args)
+    try:
+        if not _confirm(args, f"This resets {m.name}."):
+            return 2
+        d.reset({"hard": 1, "key-off": 2, "soft": 3}[args.type])
+        print("Reset accepted.")
+        return 0
+    finally:
+        d.close()
 
 
 def cmd_session(args) -> int:
-    tp, m = _channel(args)
-    kind = {"default": 1, "programming": 2, "extended": 3}[args.kind]
-    UdsClient(tp, p2=args.timeout).session(kind)
-    print(f"{m.name}: {args.kind} session accepted.")
-    return 0
+    d, m = _diag(args)
+    try:
+        d.session(args.kind)
+        print(f"{m.name}: {args.kind} session accepted.")
+        return 0
+    finally:
+        d.close()
 
 
 def cmd_did(args) -> int:
-    tp, _ = _channel(args)
-    data = UdsClient(tp, p2=args.timeout).read_did(args.did)
-    print(f"{args.did:04X}: {data.hex().upper()}  {_text(data)!r}")
-    return 0
+    d, _ = _diag(args)
+    try:
+        data = d.did(args.did)
+        print(f"{args.did:04X}: {data.hex().upper()}  {printable(data)!r}")
+        return 0
+    finally:
+        d.close()
 
 
 def _engine(args) -> ObdClient:
-    tp, _ = _channel(args)  # engine ECU 7E0/7E8 unless -m/--tx/--rx given
-    return ObdClient(tp)
+    m = find_module(args.module)  # engine ECU 7E0/7E8 unless -m/--tx/--rx given
+    tx = args.tx if args.tx is not None else m.tx_id
+    rx = args.rx if args.rx is not None else m.rx_id
+    return ObdClient(IsoTp(args.bus, tx, rx, padding=args.padding, timeout=args.timeout))
 
 
 def cmd_live(args) -> int:
@@ -235,20 +245,24 @@ def cmd_obd(args) -> int:
 
 
 def cmd_raw(args) -> int:
-    tp, _ = _channel(args)
-    payload = bytes.fromhex(args.data.replace(" ", ""))
-    tp.flush()
-    tp.send(payload)
-    deadline = time.monotonic() + args.timeout
-    while True:
-        resp = tp.recv(max(deadline - time.monotonic(), 0))
-        if resp is None:
-            print("no response", file=sys.stderr)
-            return 1
-        print(resp.hex().upper())
-        if not (resp[0] == 0x7F and len(resp) >= 3 and resp[2] == 0x78):
-            return 0
-        deadline = time.monotonic() + 5.0
+    d, _ = _diag(args)
+    try:
+        tp = d.tp
+        payload = bytes.fromhex(args.data.replace(" ", ""))
+        tp.flush()
+        tp.send(payload)
+        deadline = time.monotonic() + args.timeout
+        while True:
+            resp = tp.recv(max(deadline - time.monotonic(), 0))
+            if resp is None:
+                print("no response", file=sys.stderr)
+                return 1
+            print(resp.hex().upper())
+            if not (resp[0] == 0x7F and len(resp) >= 3 and resp[2] == 0x78):
+                return 0
+            deadline = time.monotonic() + 5.0
+    finally:
+        d.close()
 
 
 def cmd_sniff(args) -> int:
@@ -278,7 +292,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     try:
         return COMMANDS[args.cmd](args)
-    except (UdsError, IsoTpError, KeyError, ValueError) as e:
+    except (UdsError, IsoTpError, Tp20Error, KeyError, ValueError) as e:
         print(f"error: {e.args[0] if isinstance(e, KeyError) else e}", file=sys.stderr)
         return 1
     finally:

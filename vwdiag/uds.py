@@ -6,7 +6,7 @@ import time
 from typing import List
 
 from .isotp import IsoTp
-from .vag import NRC_NAMES, Dtc
+from .vag import NRC_NAMES, Dtc, KwpDtc
 
 
 class UdsError(Exception):
@@ -69,3 +69,26 @@ class UdsClient:
 
     def clear_dtcs(self, group: int = 0xFFFFFF) -> None:
         self.request(bytes([0x14]) + group.to_bytes(3, "big"))
+
+
+class KwpClient(UdsClient):
+    """KWP2000 as used by VW over TP 2.0. Request/response framing is identical to UDS."""
+
+    def start_session(self, kind: int = 0x89) -> None:
+        self.request(bytes([0x10, kind]))
+
+    def read_ident(self, option: int = 0x9B) -> bytes:
+        return self.request(bytes([0x1A, option]))[2:]
+
+    def read_dtcs(self) -> List["KwpDtc"]:  # type: ignore[override]
+        resp = self.request(bytes([0x18, 0x02, 0xFF, 0x00]))
+        body = resp[2:]
+        out = []
+        for i in range(0, len(body) - 2, 3):
+            code = int.from_bytes(body[i : i + 2], "big")
+            if code not in (0x0000, 0xFFFF):
+                out.append(KwpDtc(code, body[i + 2]))
+        return out
+
+    def clear_dtcs(self) -> None:  # type: ignore[override]
+        self.request(bytes([0x14, 0xFF, 0x00]))
