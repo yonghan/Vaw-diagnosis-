@@ -86,6 +86,25 @@ vwdiag -i sim live -n 5
 vwdiag -i sim-tp20 -m 15 dtc
 ```
 
+## Nix / NixOS
+
+```
+nix run github:yonghan/Vaw-diagnosis- -- -i sim scan   # try it
+nix develop                                            # dev shell with pytest and can-utils
+```
+
+In a NixOS configuration (flake):
+
+```nix
+inputs.vwdiag.url = "github:yonghan/Vaw-diagnosis-";
+# ...
+imports = [ inputs.vwdiag.nixosModules.default ];
+programs.vwdiag.enable = true;   # installs vwdiag + can-utils, loads SocketCAN modules
+```
+
+An overlay (`overlays.default`) is also provided. Bring the CAN interface up with
+`ip link` as shown above; the module does not configure interfaces or bitrates.
+
 ## Development
 
 ```
