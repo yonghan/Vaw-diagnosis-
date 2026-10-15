@@ -5,9 +5,17 @@ An open-source, Linux command-line diagnostic tool for Volkswagen Group vehicles
 and **OBD-II (SAE J1979)** over **ISO-TP (ISO 15765-2)** on CAN, using Linux
 **SocketCAN**. Pure Python, no runtime dependencies.
 
-> Independent project, not affiliated with Ross-Tech or Volkswagen AG.
-> Use at your own risk. Writing to ECUs can have side effects; destructive
-> commands (`clear`, `reset`) ask for confirmation.
+> ## ⚠️ Disclaimer
+>
+> **This software has not been verified on a real car.** It has only been tested
+> against the built-in simulator. **Use it at your own risk.** The authors accept no
+> liability for damage to vehicles, ECUs or other equipment, data loss, or any other
+> consequence of using it. Diagnostic requests can change ECU state; `clear` and
+> `reset` in particular can erase fault codes and readiness data or restart modules.
+> Start with read-only commands (`scan`, `ident`, `dtc`, `sniff`), and don't use it on
+> a vehicle while driving.
+>
+> Independent project, not affiliated with or endorsed by Ross-Tech or Volkswagen AG.
 
 ## Hardware
 
